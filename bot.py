@@ -19,7 +19,7 @@ firebase_admin.initialize_app(cred, {
 })
 
 # ✅ Telegram Bot Token (Environment variable se load karo)
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_TOKEN = os.getenv("7789867310:AAHM4Nyo9LZupwPZUBEFWemHlbmbvg3H_hM")
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set")
 
