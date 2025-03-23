@@ -1,149 +1,151 @@
-import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
-import yt_dlp
-import firebase_admin
-from firebase_admin import credentials, firestore
-import asyncio
-import os
+ import os
 import json
+import firebase_admin
+from firebase_admin import credentials, db
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+import yt_dlp
+import time
+import pyshorteners
 
-# Telegram bot token
-TOKEN = "7789867310:AAGWhF9vfPzPY4b1nhlBe1j4KcPAPlyxfxg"
-
-# Firebase credentials using environment variable
+# ✅ Firebase Setup (Environment variable se load karo)
 firebase_credentials = os.getenv("FIREBASE_CREDENTIALS")
 if not firebase_credentials:
     raise ValueError("FIREBASE_CREDENTIALS environment variable not set")
 cred_dict = json.loads(firebase_credentials)
 cred = credentials.Certificate(cred_dict)
-firebase_admin.initialize_app(cred)
-db = firestore.client()
+firebase_admin.initialize_app(cred, {
+    "databaseURL": "https://telegram-15b0b.firebaseio.com"
+})
 
-# Logging setup
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+# ✅ Telegram Bot Token (Environment variable se load karo)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set")
 
-# Start command
-async def start(update: Update, context: CallbackContext) -> None:
+# ✅ TinyURL Setup (Smart link ke liye)
+shortener = pyshorteners.Shortener()
+
+def create_smart_link(original_url):
+    """ YouTube ka direct download link ko TinyURL me convert karega """
+    try:
+        return shortener.tinyurl.short(original_url)
+    except Exception as e:
+        print(f"Error creating TinyURL: {str(e)}")
+        return original_url
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Send me a YouTube link to get download options!")
 
-# Handle YouTube links
-async def handle_message(update: Update, context: CallbackContext) -> None:
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
-
     if "youtube.com" in url or "youtu.be" in url:
         await update.message.reply_text("Fetching download options...")
-
-        # yt-dlp options for smart links with audio and speed
-        ydl_opts_base = {
-            'quiet': True,
-            'noplaylist': True,
-            'merge_output_format': 'mp4',
-            'http_chunk_size': '10M',  # Faster streaming
-            'no_cache_dir': True,      # No overhead
-            'simulate': True,          # Get merged URLs without downloading
-            'get_url': True,           # Extract the final merged URL
-        }
         try:
-            # Step 1: Get all available formats
-            with yt_dlp.YoutubeDL(ydl_opts_base) as ydl:
-                logger.info(f"Processing URL: {url}")
-                # Small delay to avoid rate-limiting (ban safe)
-                await asyncio.sleep(1)
+            ydl_opts = {
+                "quiet": True,
+                "format_sort": ["res", "ext:mp4"],
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 formats = info.get("formats", [])
-                logger.info(f"Found {len(formats)} formats")
 
-                # Log all formats for debugging (detailed)
-                for fmt in formats:
-                    logger.info(f"Format: {fmt.get('format_id')} - {fmt.get('height', 'unknown')}p - {fmt.get('ext')} - vcodec: {fmt.get('vcodec')}")
-
-                # Step 2: Filter video formats (only check for height)
-                video_formats = [
-                    fmt for fmt in formats
-                    if fmt.get("height") is not None
-                ]
-                # Sort by height (resolution) in ascending order
-                video_formats.sort(key=lambda x: x.get("height"))
-
-                # Log filtered video formats
-                logger.info(f"Found {len(video_formats)} video formats after filtering")
-                for fmt in video_formats:
-                    logger.info(f"Filtered Video Format: {fmt.get('format_id')} - {fmt.get('height')}p - {fmt.get('ext')}")
-
-                # Step 3: For each video format, merge with best audio
-                buttons = []
-                seen_qualities = set()
-                for fmt in video_formats:
-                    quality = str(fmt.get("height", "Unknown"))
-                    if quality in seen_qualities:
+            keyboard = []
+            seen_resolutions = set()
+            for f in formats:
+                if f.get("format_id") in ["18", "22", "137", "399", "400"]:
+                    quality = f.get("format_note", "Unknown")
+                    if quality in seen_resolutions:
                         continue
-                    seen_qualities.add(quality)
+                    seen_resolutions.add(quality)
+                    size = f.get("filesize", 0)
+                    size_mb = size / (1024 * 1024) if size else "Unknown"
+                    button = InlineKeyboardButton(f"{quality} ({size_mb:.2f} MB)" if size else f"{quality} (Size Unknown)",
+                                                callback_data=f"{f['format_id']}|{url}")
+                    keyboard.append([button])
 
-                    # Create specific yt-dlp options for this quality
-                    ydl_opts = ydl_opts_base.copy()
-                    ydl_opts['format'] = f"bestvideo[height={fmt.get('height')}]+bestaudio/best"
+            if not keyboard:
+                await update.message.reply_text("No downloadable formats found. Please try another video.")
+                return
 
-                    # Fetch the merged URL for this specific quality
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl_specific:
-                        info_specific = ydl_specific.extract_info(url, download=False)
-                        download_url = info_specific.get("url")
-                        if not download_url:
-                            logger.warning(f"No URL found for {quality}p")
-                            continue
-
-                        size = fmt.get("filesize") or fmt.get("filesize_approx")
-                        size_mb = round(size / (1024 * 1024), 2) if size else "Unknown"
-                        logger.info(f"Quality: {quality}, URL: {download_url}")
-
-                        # Store in Firebase
-                        try:
-                            doc_ref = db.collection("video_links").document()
-                            doc_ref.set({
-                                "url": download_url,
-                                "quality": quality,
-                                "youtube_link": url,
-                                "timestamp": firestore.SERVER_TIMESTAMP
-                            })
-                        except Exception as e:
-                            logger.error(f"Firebase write error: {str(e)}")
-                            await update.message.reply_text(f"Error saving {quality}p link.")
-                            continue
-
-                        # Smart link button
-                        button = InlineKeyboardButton(f"{quality}p ({size_mb} MB)", url=download_url)
-                        buttons.append([button])
-
-                if buttons:
-                    reply_markup = InlineKeyboardMarkup(buttons)
-                    await update.message.reply_text("Choose a quality:", reply_markup=reply_markup)
-                else:
-                    await update.message.reply_text("No suitable video formats found.")
-                    logger.warning("No valid video formats found")
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text("Choose a quality:", reply_markup=reply_markup)
         except Exception as e:
-            logger.error(f"Error: {str(e)}")
-            await update.message.reply_text(f"Error fetching link: {str(e)}")
+            await update.message.reply_text(f"Error fetching link: {str(e)}\nTry another video.")
     else:
-        await update.message.reply_text("Please send a valid YouTube link.")
+        await update.message.reply_text("Please send a valid YouTube link!")
 
-def main() -> None:
-    # Build the application
-    application = Application.builder().token(TOKEN).build()
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    format_id, url = query.data.split("|")
 
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    await query.message.reply_text("Generating smart download link...")
 
-    # Start polling
-    logger.info("Starting bot...")
     try:
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-    finally:
-        # Ensure clean shutdown
-        logger.info("Shutting down bot...")
-        import asyncio
-        asyncio.run(application.shutdown())
+        # ✅ Force audio aur video merge
+        ydl_opts = {
+            "format": f"{format_id}+bestaudio/best",  # Video + Best Audio
+            "get_url": True,  # Sirf URL nikaal, download mat karo
+            "merge_output_format": "mp4",  # Force MP4 output with audio
+            "postprocessors": [{  # Ensure audio aur video merge ho
+                "key": "FFmpegMerge",
+                "preferredcodec": "mp4",
+            }],
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            direct_url = info.get("url")
+
+            # ✅ Agar audio nahi hai, toh alag se audio stream fetch karo
+            if not direct_url:
+                # Fallback: Audio alag se fetch karo
+                ydl_opts_fallback = {
+                    "format": "bestaudio/best",
+                    "get_url": True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts_fallback) as ydl_fallback:
+                    audio_info = ydl_fallback.extract_info(url, download=False)
+                    audio_url = audio_info.get("url")
+                    if audio_url:
+                        # Audio aur video URL combine karo (client-side merging ke liye)
+                        direct_url = f"{direct_url}|{audio_url}" if direct_url else audio_url
+                    else:
+                        await query.message.reply_text("❌ Audio not found for this video. Try another quality or video.")
+                        return
+
+        # ✅ Smart Link Generate Karo (TinyURL)
+        smart_link = create_smart_link(direct_url)
+
+        # ✅ Firebase me Link Store karein
+        ref = db.reference("downloads").push({
+            "title": info.get("title", "Unknown Title"),
+            "url": url,
+            "direct_url": direct_url,
+            "smart_link": smart_link,
+            "format_id": format_id,
+            "timestamp": int(time.time())
+        })
+        link_id = ref.key
+        firebase_link = f"https://telegram-15b0b.firebaseio.com/downloads/{link_id}.json"
+
+        # ✅ User ko Smart Link Send Karo
+        await query.message.reply_text(
+            f"✅ Download ready: [Click Here]({smart_link})\n\n"
+            f"⚠️ Note: This link may expire soon (usually within 24 hours). Download quickly!\n\n"
+            f"Stored in Firebase: [View Metadata]({firebase_link})",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await query.message.reply_text(f"❌ Error: {str(e)}")
+
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
