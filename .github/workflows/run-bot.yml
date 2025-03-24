@@ -1,0 +1,35 @@
+name: Run Telegram Bot
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Har 6 ghante mein chalega (00:00, 06:00, 12:00, 18:00 UTC)
+  workflow_dispatch:  # Manual trigger ke liye
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Repo clone karo
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Step 2: Python setup karo
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'  # Python version jo tera bot use karta hai
+
+      # Step 3: Dependencies install karo
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Step 4: Bot chalao
+      - name: Run bot
+        env:
+          FIREBASE_CREDENTIALS: ${{ secrets.FIREBASE_CREDENTIALS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          python bot.py
